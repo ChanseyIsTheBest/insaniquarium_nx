@@ -96,3 +96,5 @@ Andy Nguyen, fgsfds and ChanseyIsTheBest, building on TheOfficialFloW's
 Vita/Switch loader tradition — reaching this project via the Bouncemasters and
 BTD5 ports. The Insaniquarium PortMaster port supplied the decompilation bug
 fixes. All MIT-licensed. Thanks to everyone in that lineage.
+
+Icon by Princeso_Caguai on SteamDB
