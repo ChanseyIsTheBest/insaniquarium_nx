@@ -41,7 +41,13 @@ def sub(path, old, new, label, count=1):
         print(f"   [MISSING FILE] {label}  ({path})")
         return False
     data = p.read_bytes()
-    for o, n in ((crlf(old), crlf(new)), (old, new)):
+    # Choose the line-ending variant from the FILE, not from match order. For a
+    # single-line pattern crlf(old) == old, so the CRLF variant always matched
+    # first and wrote a CRLF replacement into LF files -- three stray CRLF lines
+    # in Board.cpp. Harmless to the compiler, but a file should have one ending.
+    is_crlf = b"\r\n" in data
+    variants = ((crlf(old), crlf(new)), (old, new)) if is_crlf else ((old, new),)
+    for o, n in variants:
         if o in data:
             p.write_bytes(data.replace(o, n, count))
             print(f"   [ok] {label}")
@@ -307,10 +313,75 @@ def main():
               b"void DataWriter::WriteLong(ulong theValue)\n{\n    //theValue = LONG_NATIVE_TO_LITTLEE(theValue);\n    WriteBytes(&theValue, sizeof(theValue));",
               b"void DataWriter::WriteLong(ulong theValue)\n{\n    uint32_t aValue = (uint32_t)theValue;  // 32 bits on disk, see apply-cxx-modern.py\n    WriteBytes(&aValue, sizeof(aValue));",
               "DataSync.cpp: WriteLong writes 32 bits")
+    # The one write that bypasses the primitives. Board::SyncGameData reserves a
+    # 4-byte placeholder with WriteLong(0), counts the objects it writes, then
+    # patches the count back with a raw memcpy of sizeof(aNumOfObjects) -- and
+    # aNumOfObjects is a ulong, 8 bytes here. That writes the count over the
+    # placeholder AND the four bytes after it, which are the first object's
+    # mType, leaving them zero. Read back: count 6, first object type 0, and
+    # every field after it misaligned.
+    #
+    # Found by decoding a save from the fixed build: bytes 14..21 read
+    # 06 00 00 00 00 00 00 00 -- an 8-byte 6 over a 4-byte slot.
+    ok &= sub("Board.cpp",
+              b"\t\t\tmemcpy((char*)aDW->mMemoryHandle + aPos, &aNumOfObjects, sizeof(aNumOfObjects));",
+              b"\t\t{\n\t\t\tuint32_t aCount32 = (uint32_t)aNumOfObjects;  /* 32 bits on disk, see apply-cxx-modern.py */\n\t\t\tmemcpy((char*)aDW->mMemoryHandle + aPos, &aCount32, sizeof(aCount32));\n\t\t}",
+              "Board.cpp: object-count patch-back writes 32 bits")
+
+    # Float goes through a ulong stage in both directions -- 8 bytes here where
+    # the format wants 4 -- and WriteFloat's reinterpret_cast<ulong&> on a float
+    # reads four bytes past it, which is undefined behaviour. Nothing in the
+    # game syncs a float today, so this is latent, but it is the same bug as
+    # the other three and just as cheap to close.
+    ok &= sub("DataSync.cpp",
+              b"    ulong result;\n    ReadBytes(&result, sizeof(result));\n    //result = LONG_LITTLEE_TO_NATIVE(result);\n    return reinterpret_cast<float&>(result);",
+              b"    uint32_t result;  // 32 bits on disk, see apply-cxx-modern.py\n    ReadBytes(&result, sizeof(result));\n    //result = LONG_LITTLEE_TO_NATIVE(result);\n    return reinterpret_cast<float&>(result);",
+              "DataSync.cpp: ReadFloat reads 32 bits")
+    ok &= sub("DataSync.cpp",
+              b"    ulong result = reinterpret_cast<ulong&>(theValue);\n    //result = LONG_NATIVE_TO_LITTLEE(result);\n    WriteBytes(&result, sizeof(result));",
+              b"    uint32_t result = reinterpret_cast<uint32_t&>(theValue);  // 32 bits on disk\n    //result = LONG_NATIVE_TO_LITTLEE(result);\n    WriteBytes(&result, sizeof(result));",
+              "DataSync.cpp: WriteFloat writes 32 bits")
+
     ok &= sub("DataSync.cpp",
               b"#include <vector>\n",
               b"#include <vector>\n#include <cstdint>\n",
               "DataSync.cpp: <cstdint> for uint32_t")
+
+    print("== a corrupt or foreign save must not be fatal ==")
+    # Nothing in the game catches DataReaderException, so a save the serialiser
+    # cannot parse -- one written by a previous build with a different layout,
+    # a truncated file, a PC save from a different version -- aborts the
+    # process from inside Board::LoadGame. The caller already copes with a
+    # false return: LoadBoardGame does CreateBoard(); if (!LoadGame())
+    # RemoveBoard(); so the half-populated board is discarded and the game
+    # starts fresh, and the next exit overwrites the bad file with a good one.
+    #
+    # Guarded at the reader entry points, not deeper: LoadGame, and the two
+    # profile readers on the same serialiser.
+    ok &= sub("Board.cpp",
+              b"\tBuffer aBuf;\n\tif (mApp->ReadBufferFromFile(theSavePath, &aBuf, false))\n\t{\n\t\tDataReader aDR;",
+              b"\tBuffer aBuf;\n\ttry {\n\tif (mApp->ReadBufferFromFile(theSavePath, &aBuf, false))\n\t{\n\t\tDataReader aDR;",
+              "Board.cpp: LoadGame guards the read")
+    ok &= sub("Board.cpp",
+              b"\t\t\treturn true;\n\t\t}\n\t}\n\treturn false;\n}",
+              b"\t\t\treturn true;\n\t\t}\n\t}\n\t} catch (DataReaderException&) {\n\t\t/* unreadable save: start fresh, see apply-cxx-modern.py */\n\t}\n\treturn false;\n}",
+              "Board.cpp: LoadGame catches DataReaderException")
+    # The user list and per-user profile, same serialiser, read at startup and
+    # on profile select -- a stale users.dat would crash before the menu.
+    ok &= sub("ProfileMgr.cpp",
+              b"        DataSync aDS(aDR);\n        SyncUsersDat(aDS);\n    }\n}",
+              b"        DataSync aDS(aDR);\n        try { SyncUsersDat(aDS); }\n        catch (DataReaderException&) { if (mProfilesMap) mProfilesMap->clear(); }  /* unreadable: no users */\n    }\n}",
+              "ProfileMgr.cpp: ReadUsersDat catches DataReaderException")
+    ok &= sub("ProfileMgr.cpp",
+              b"        SyncData(aDS);\n        SetCheatFlag(6, false);\n    }\n}",
+              b"        try { SyncData(aDS); }\n        catch (DataReaderException&) { /* unreadable profile: defaults */ }\n        SetCheatFlag(6, false);\n    }\n}",
+              "ProfileMgr.cpp: LoadFromMemory catches DataReaderException")
+    # highscores.dat, read at startup; a bad one falls back to the defaults the
+    # missing-file path already uses.
+    ok &= sub("HighScoreMgr.cpp",
+              b"        DataSync aDS(aDR);\n        SyncData(&aDS);\n    }\n    else\n        MakeDefaultHighScores();",
+              b"        DataSync aDS(aDR);\n        try { SyncData(&aDS); }\n        catch (DataReaderException&) { ClearAllScoreLists(); MakeDefaultHighScores(); }\n    }\n    else\n        MakeDefaultHighScores();",
+              "HighScoreMgr.cpp: loader catches DataReaderException")
 
     print("== 64-bit array counting ==")
     ok &= regex_all(r"sizeof\(mCheatCodes\)\s*/\s*4",

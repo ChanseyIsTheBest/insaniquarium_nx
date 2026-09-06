@@ -38,7 +38,13 @@ def sub(path, old, new, label, count=1):
         print(f"   [MISSING FILE] {label}  ({path})")
         return False
     data = p.read_bytes()
-    for o, n in ((crlf(old), crlf(new)), (old, new)):
+    # Choose the line-ending variant from the FILE, not from match order. For a
+    # single-line pattern crlf(old) == old, so the CRLF variant always matched
+    # first and wrote a CRLF replacement into LF files -- three stray CRLF lines
+    # in Board.cpp. Harmless to the compiler, but a file should have one ending.
+    is_crlf = b"\r\n" in data
+    variants = ((crlf(old), crlf(new)), (old, new)) if is_crlf else ((old, new),)
+    for o, n in variants:
         if o in data:
             p.write_bytes(data.replace(o, n, count))
             print(f"   [ok] {label}")
